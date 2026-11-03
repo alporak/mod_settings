@@ -17,6 +17,8 @@
 #include <RED4ext/Scripting/Natives/Generated/user/SettingsVarListInt.hpp>
 #include <RedLib.hpp>
 #include <iostream>
+#include <cerrno>
+#include <cstring>
 #include <Hooks/ApplyOverrides.hpp>
 #ifdef __APPLE__
 #include "MacShims.hpp"
@@ -25,6 +27,14 @@
 namespace ModSettings {
 
 INIReader reader;
+// set when user.ini exists but could not be opened or parsed; WriteToFile then
+// refuses to overwrite it so the user's settings are not replaced with defaults
+bool readFailed = false;
+
+static std::string ToLower(std::string str) {
+  std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+  return str;
+}
 
 #ifdef __APPLE__
 // user.ini lives in the plugin folder, as on Windows (<root>/red4ext/plugins/mod_settings/user.ini). Found with dladdr, not by
@@ -54,9 +64,21 @@ void AddVariable(Variable* variable) {
   queuedVariables.emplace_back(variable);
 }
 
-void __fastcall ModSettings::ProcessScriptData(const ScriptData *scriptData) {
+void __fastcall ModSettings::ProcessScriptData(const CScriptedDataEnvironment *scriptData) {
   auto self = ModSettings::GetInstance();
   if (scriptData) {
+    // The game releases several script environments per launch (3 on 2.5, more
+    // with mod.io script mods) and only one holds the compiled mods. Keep the
+    // registry from that one instead of letting a later, empty one wipe it.
+    auto settingsProps = 0u;
+    for (const auto &scriptClass : scriptData->classes)
+      for (const auto &prop : scriptClass->properties)
+        if (prop->attributes.size && prop->IsValid())
+          settingsProps++;
+    sdk->logger->InfoF(pluginHandle, "Script data: %u classes, %u Mod Settings properties",
+                       scriptData->classes.Size(), settingsProps);
+    if (!settingsProps && !self->mods.empty())
+      return;
     ModSettings::ReadFromFile();
     ModSettings::ClearVariables();
     for (const auto &scriptClass : scriptData->classes) {
@@ -70,7 +92,7 @@ void __fastcall ModSettings::ProcessScriptData(const ScriptData *scriptData) {
         //   if (found)
         //     continue;
         // }
-        if (prop->runtimeProperties.size) {
+        if (prop->attributes.size) {
           if (prop->IsValid()) {
             auto modName = prop->ReadProperty("ModSettings.mod");
             if (!self->mods.contains(modName)) {
@@ -128,15 +150,20 @@ void __fastcall ModSettings::ProcessScriptData(const ScriptData *scriptData) {
       auto mod = self->mods[var->modName];
 
       auto modClassName = CNamePool::Add(var->className);
-      std::shared_lock _(*mod->classes_lock);
-      if (!mod->classes.contains(modClassName)) {
+      ModClass *modClass;
+      {
+        // exclusive from the start: upgrading a shared_lock to a unique_lock
+        // on the same thread deadlocks (SRW locks are not recursive), and
+        // release it before the callback below runs
         std::unique_lock _(*mod->classes_lock);
-        mod->classes[modClassName] = new ModClass {
-          .name = modClassName,
-          .mod = mod
-        };
+        if (!mod->classes.contains(modClassName)) {
+          mod->classes[modClassName] = new ModClass {
+            .name = modClassName,
+            .mod = mod
+          };
+        }
+        modClass = mod->classes[modClassName];
       }
-      auto &modClass = mod->classes[modClassName];
 
       auto categoryName = CNamePool::Add(var->categoryName);
       if (!modClass->categories.contains(categoryName)) {
@@ -184,6 +211,18 @@ void __fastcall ModSettings::ProcessScriptData(const ScriptData *scriptData) {
             }
           }
         }
+      }
+    }
+    // the registry was rebuilt: attach listeners registered before it existed
+    std::vector<WeakHandle<IScriptable>> classListeners;
+    {
+      std::unique_lock _(self->classListeners_lock);
+      classListeners = self->classListeners;
+    }
+    for (auto &weak : classListeners) {
+      if (auto listener = weak.Lock()) {
+        auto matched = AttachClassListener(listener);
+        sdk->logger->InfoF(pluginHandle, "Listener %s attached to %u classes", listener->GetType()->GetName().ToString(), matched);
       }
     }
   }
@@ -256,6 +295,9 @@ DynArray<CName> ModSettings::GetMods() {
 DynArray<CName> ModSettings::GetCategories(CName modName) {
   auto array = DynArray<CName>(new Memory::DefaultAllocator);
   std::vector<std::pair<CName, ModCategory*>> modCategories;
+  // mods[] would insert a null Mod for an unknown name and crash on it
+  if (!modSettings.mods.contains(modName))
+    return array;
   for (auto const &[modClassName, modClass] : modSettings.mods[modName]->classes) {
     for (auto itr = modClass->categories.begin(); itr != modClass->categories.end(); ++itr ) {
       modCategories.push_back(*itr); 
@@ -342,6 +384,7 @@ void ModSettings::AddOverrides(Manager* manager) {
   ModSettingsMac::LogOnce("overrides-manager", "ModSettings::AddOverrides(Manager*) is not used on Mac (see AddOverridesMac)");
   return;
 #endif
+  uint32_t replaced = 0, unchanged = 0, notFound = 0;
   for (const auto &[modName, mod] : modSettings.mods) {
     std::unique_lock _(*mod->classes_lock);
     for (const auto &[className, modClass] : mod->classes) {
@@ -350,38 +393,133 @@ void ModSettings::AddOverrides(Manager* manager) {
           if (variable->type->GetName() == "EInputKey") {
             auto name = variable->name.ToString();
             auto key = *(EInputKey*)variable->runtimeVar->GetAcceptedValue();
-            if (manager->Override(name, (uint16_t)key, applyOverridesCallNumber) == Manager::OverrideStatus::NotFound) {
+            auto status = manager->Override(name, (uint16_t)key, applyOverridesCallNumber);
+            if (status == Manager::OverrideStatus::NotFound) {
+              notFound++;
               sdk->logger->WarnF(pluginHandle, "overridableUI \"%s\" not found (%s, %s)", name, modName.ToString(), className.ToString());
+            } else if (status & Manager::OverrideStatus::Replaced) {
+              replaced++;
+              sdk->logger->InfoF(pluginHandle, "overridableUI \"%s\" set to key %u", name, (uint32_t)key);
+            } else {
+              unchanged++;
             }
           }
         }
       }
     }
   }
+  sdk->logger->InfoF(pluginHandle, "Key binding overrides, call %u on thread %u: %u mods, %u replaced, %u unchanged, %u not found",
+                     applyOverridesCallNumber, GetCurrentThreadId(), (uint32_t)modSettings.mods.size(), replaced, unchanged, notFound);
   applyOverridesCallNumber++;
 }
 
+void ModSettings::BackupFile() {
+  std::error_code ec;
+  if (!std::filesystem::exists(configPath, ec)) {
+    return;
+  }
+  auto backupPath = configPath;
+  backupPath += ".bak";
+  if (std::filesystem::copy_file(configPath, backupPath, std::filesystem::copy_options::overwrite_existing, ec)) {
+    sdk->logger->InfoF(pluginHandle, "User settings backed up to: %s", backupPath.string().c_str());
+  } else {
+    sdk->logger->WarnF(pluginHandle, "Could not back up user settings to %s: %s", backupPath.string().c_str(), ec.message().c_str());
+  }
+}
+
+// Writes an entry read from user.ini back out unchanged
+static void WriteEntry(std::ofstream &stream, const INIReader::Entry &entry) {
+  stream << entry.name << " = ";
+  for (const auto c : entry.value) {
+    stream << c;
+    if (c == '\n') {
+      stream << "  "; // keep continuation lines parseable
+    }
+  }
+  stream << "\n";
+}
+
 void ModSettings::WriteToFile() {
-  std::ofstream configFile(configPath);
-  if (configFile.is_open()) {
-    for (const auto &[modName, mod] : modSettings.mods) {
-      std::unique_lock _(*mod->classes_lock);
-      for (const auto &[className, modClass] : mod->classes) {
-        configFile << "[" << className.ToString() << "]\n";
-        for (const auto &[categoryName, category] : modClass->categories) {
-          for (const auto &[variableName, variable] : category->variables) {
-            configFile << *variable;
-          }
-        }
-        modClass->NotifyListeners();
-        configFile << "\n";
+  auto outputPath = configPath;
+  if (readFailed) {
+    outputPath += ".new";
+    sdk->logger->WarnF(pluginHandle, "User settings could not be read at startup; writing to %s instead of overwriting %s", outputPath.string().c_str(), configPath.string().c_str());
+  } else {
+    ModSettings::BackupFile();
+  }
+  std::ofstream configFile(outputPath);
+  if (!configFile.is_open()) {
+    sdk->logger->WarnF(pluginHandle, "Could not write to file: %s", outputPath.string().c_str());
+    return;
+  }
+
+  // registered classes by lower-case name (INIReader lookups are case-insensitive)
+  std::map<std::string, std::pair<Mod *, ModClass *>> registered;
+  for (const auto &[modName, mod] : modSettings.mods) {
+    std::shared_lock _(*mod->classes_lock);
+    for (const auto &[className, modClass] : mod->classes) {
+      registered[ToLower(className.ToString())] = {mod, modClass};
+    }
+  }
+
+  const auto &entries = reader.Entries();
+  uint32_t preservedSections = 0;
+  uint32_t preservedKeys = 0;
+
+  auto writeClass = [&](Mod *mod, ModClass *modClass, const std::string &lowerClassName) {
+    std::unique_lock _(*mod->classes_lock);
+    configFile << "[" << modClass->name.ToString() << "]\n";
+    std::set<std::string> writtenKeys;
+    for (const auto &[categoryName, category] : modClass->categories) {
+      for (const auto &[variableName, variable] : category->variables) {
+        configFile << *variable;
+        writtenKeys.insert(ToLower(variable->runtimeVar->name.ToString()));
       }
     }
-    configFile.close();
-    sdk->logger->InfoF(pluginHandle, "User settings written to file: %s", configPath.string().c_str());
-  } else {
-    sdk->logger->InfoF(pluginHandle, "Could not write to file: %s", configPath.string().c_str());
+    // keys of this class that were in the file but are not registered this session
+    for (const auto &entry : entries) {
+      if (ToLower(entry.section) == lowerClassName && !writtenKeys.contains(ToLower(entry.name))) {
+        WriteEntry(configFile, entry);
+        preservedKeys++;
+      }
+    }
+    modClass->NotifyListeners();
+    configFile << "\n";
+  };
+
+  // sections in the order they were read, so the file stays stable between sessions
+  std::set<std::string> written;
+  for (const auto &entry : entries) {
+    auto lowerSection = ToLower(entry.section);
+    if (written.contains(lowerSection)) {
+      continue;
+    }
+    written.insert(lowerSection);
+    auto found = registered.find(lowerSection);
+    if (found != registered.end()) {
+      writeClass(found->second.first, found->second.second, lowerSection);
+    } else {
+      // no mod registered this section (mod removed or disabled): carry it over untouched
+      configFile << "[" << entry.section << "]\n";
+      for (const auto &other : entries) {
+        if (ToLower(other.section) == lowerSection) {
+          WriteEntry(configFile, other);
+          preservedKeys++;
+        }
+      }
+      configFile << "\n";
+      preservedSections++;
+    }
   }
+  // classes registered this session that were not in the file yet
+  for (const auto &[lowerClassName, modAndClass] : registered) {
+    if (!written.contains(lowerClassName)) {
+      writeClass(modAndClass.first, modAndClass.second, lowerClassName);
+    }
+  }
+
+  configFile.close();
+  sdk->logger->InfoF(pluginHandle, "User settings written to file: %s (%u registered classes, %u unregistered sections and %u unregistered keys preserved)", outputPath.string().c_str(), (uint32_t)registered.size(), preservedSections, preservedKeys);
 }
 
 bool ModSettings::GetSettingString(CName className, CName propertyName, CString *value) {
@@ -395,7 +533,11 @@ bool ModSettings::GetSettingString(CName className, CName propertyName, CString 
   }
 }
 
-void ModSettings::ReadValueFromFile(ScriptProperty *prop, void* pointer) {
+#ifdef __APPLE__
+void ModSettings::ReadValueFromFile(CScriptedDataProperty *prop, void* pointer) {
+#else
+void ModSettings::ReadValueFromFile(CScriptedDataProperty *prop, ScriptInstance pointer) {
+#endif
   CString settingFromFile;
   if (ModSettings::GetSettingString(prop->parent->name, prop->name, &settingFromFile)) {
     prop->FromString(pointer, settingFromFile);
@@ -403,11 +545,39 @@ void ModSettings::ReadValueFromFile(ScriptProperty *prop, void* pointer) {
 }
 
 void ModSettings::ReadFromFile() {
-  reader = INIReader(configPath.string());
+  readFailed = false;
+  reader = INIReader();
 
-  if (reader.ParseError() != 0) {
+  std::error_code ec;
+  if (!std::filesystem::exists(configPath, ec)) {
+    sdk->logger->InfoF(pluginHandle, "No user settings file at %s, using defaults", configPath.string().c_str());
     return;
   }
+
+#ifdef __APPLE__
+  // macOS paths are UTF-8, so the narrow open is the right one.
+  auto file = fopen(configPath.string().c_str(), "r");
+#else
+  // open with the wide path: fopen() with a narrow path fails when the game
+  // folder contains characters outside the system code page
+  auto file = _wfopen(configPath.c_str(), L"r");
+#endif
+  if (!file) {
+    readFailed = true;
+    sdk->logger->WarnF(pluginHandle, "Could not open user settings file %s (%s); using defaults, it will not be overwritten", configPath.string().c_str(), std::strerror(errno));
+    return;
+  }
+  reader = INIReader(file);
+  fclose(file);
+
+  auto error = reader.ParseError();
+  if (error != 0) {
+    readFailed = true;
+    sdk->logger->WarnF(pluginHandle, "Parse error on line %d of %s; settings on other lines were loaded, the file will not be overwritten until it is fixed", error, configPath.string().c_str());
+  } else if (reader.Entries().empty()) {
+    sdk->logger->WarnF(pluginHandle, "User settings file %s is empty, using defaults", configPath.string().c_str());
+  }
+  sdk->logger->InfoF(pluginHandle, "Read user settings from %s: %u sections, %u keys", configPath.string().c_str(), (uint32_t)reader.Sections().size(), (uint32_t)reader.Entries().size());
 }
 
 void ModSettings::AcceptChanges() {
@@ -415,9 +585,11 @@ void ModSettings::AcceptChanges() {
   if (gameinputManager != nullptr)
     ApplyOverrides(gameinputManager);
 #ifdef __APPLE__
-  if (gameinputUserMapping != nullptr)
+  else if (gameinputUserMapping != nullptr)
     ApplyOverridesMac(gameinputUserMapping);
 #endif
+  else
+    sdk->logger->Warn(pluginHandle, "Key binding changes not applied: the game's input manager was not captured");
   modSettings.changesRequested = false;
   modSettings.NotifyListeners();
 }
@@ -442,7 +614,7 @@ void ModSettings::RejectChanges() {
     for (auto [modClassName, modClass] : mod->classes) {
       for (auto [categoryName, category] : modClass->categories) {
         for (auto [variableName, variable] : category->variables) {
-          modSettings.changesRequested |= variable->RestoreDefault();
+          variable->RejectChange();
         }
       }
     }
@@ -454,7 +626,12 @@ void ModSettings::RejectChanges() {
 void ModSettings::NotifyListeners() {
   // std::shared_lock _(listeners_lock);
   this->listeners_lock.LockShared();
-  for (auto &[id, listener] : this->listeners) {
+  auto listeners = this->listeners;
+  this->listeners_lock.UnlockShared();
+  // call back outside the lock: a listener that (un)registers itself from
+  // the callback would otherwise take the exclusive lock on the thread that
+  // holds the shared one and spin forever
+  for (auto &[id, listener] : listeners) {
     if (listener) {
       auto instance = listener.Lock();
       auto func = instance->GetType()->GetFunction("OnModSettingsChange");
@@ -471,13 +648,17 @@ void ModSettings::NotifyListeners() {
       // remove?
     }
   }
-  this->listeners_lock.UnlockShared();
 }
 
 void ModSettings::NotifyListenersRequested(CName aGroupPath, CName aVarName) {
   // std::shared_lock _(listeners_lock);
   this->listeners_lock.LockShared();
-  for (auto &[id, listener] : this->listeners) {
+  auto listeners = this->listeners;
+  this->listeners_lock.UnlockShared();
+  // call back outside the lock: a listener that (un)registers itself from
+  // the callback would otherwise take the exclusive lock on the thread that
+  // holds the shared one and spin forever
+  for (auto &[id, listener] : listeners) {
     if (listener) {
       auto instance = listener.Lock();
       auto func = instance->GetType()->GetFunction("OnModVariableChangeRequested");
@@ -502,13 +683,17 @@ void ModSettings::NotifyListenersRequested(CName aGroupPath, CName aVarName) {
       // remove?
     }
   }
-  this->listeners_lock.UnlockShared();
 }
 
 void ModSettings::NotifyListenersAccepted(CName aGroupPath, CName aVarName) {
   // std::shared_lock _(listeners_lock);
   this->listeners_lock.LockShared();
-  for (auto &[id, listener] : this->listeners) {
+  auto listeners = this->listeners;
+  this->listeners_lock.UnlockShared();
+  // call back outside the lock: a listener that (un)registers itself from
+  // the callback would otherwise take the exclusive lock on the thread that
+  // holds the shared one and spin forever
+  for (auto &[id, listener] : listeners) {
     if (listener) {
       auto instance = listener.Lock();
       auto func = instance->GetType()->GetFunction("OnModVariableChangeAccepted");
@@ -533,7 +718,6 @@ void ModSettings::NotifyListenersAccepted(CName aGroupPath, CName aVarName) {
       // remove?
     }
   }
-  this->listeners_lock.UnlockShared();
 }
 
 void ModSettings::RegisterListenerToModifications(const Handle<IScriptable> &listener) {
@@ -554,23 +738,47 @@ void ModSettings::UnregisterListenerToModifications(const Handle<IScriptable> &l
   }
 }
 
+// Registers the listener with each registered class in its hierarchy, which
+// also gives it the current values; returns how many classes matched
+uint32_t ModSettings::AttachClassListener(const Handle<IScriptable> &listener) {
+  uint32_t matched = 0;
+  auto type = listener->GetType();
+  do {
+    auto className = type->GetName();
+    for (auto &[modName, mod] : modSettings.mods) {
+      if (mod->classes.contains(className)) {
+        mod->classes[className]->RegisterListener(listener);
+        matched++;
+      }
+    }
+    type = type->parent;
+  } while (type);
+  return matched;
+}
+
 void ModSettings::RegisterListenerToClass(const Handle<IScriptable> &listener) {
   if (listener) {
-    auto type = listener->GetType();
-    do {
-      auto className = type->GetName();
-      for (auto &[modName, mod] : modSettings.mods) {
-        if (mod->classes.contains(className)) {
-          mod->classes[className]->RegisterListener(listener);
-        }
-      }
-      type = type->parent;
-    } while (type);
+    {
+      std::unique_lock _(modSettings.classListeners_lock);
+      std::erase_if(modSettings.classListeners, [&](const WeakHandle<IScriptable> &other) {
+        return other.Expired() || other.instance == listener.instance;
+      });
+      modSettings.classListeners.emplace_back(listener);
+    }
+    if (!AttachClassListener(listener))
+      sdk->logger->InfoF(pluginHandle, "Listener %s registered before its class; attached once the script data is processed",
+                         listener->GetType()->GetName().ToString());
   }
 }
 
 void ModSettings::UnregisterListenerToClass(const Handle<IScriptable> &listener) {
   if (listener) {
+    {
+      std::unique_lock _(modSettings.classListeners_lock);
+      std::erase_if(modSettings.classListeners, [&](const WeakHandle<IScriptable> &other) {
+        return other.Expired() || other.instance == listener.instance;
+      });
+    }
     auto type = listener->GetType();
     do {
       auto className = type->GetName();

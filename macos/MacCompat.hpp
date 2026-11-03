@@ -78,5 +78,14 @@
 // only compile when the umbrella header comes first, so every translation unit gets it first (the Windows stdafx.hpp precompiled
 // header did the same).
 #include <RED4ext/RED4ext.hpp>
+#include <pthread.h>
+
+// processthreadsapi.h, used in a log line (ModSettings::AddOverrides). The low 32 bits of the Mach thread id, like the Windows DWORD.
+inline uint32_t GetCurrentThreadId()
+{
+    uint64_t tid = 0;
+    pthread_threadid_np(nullptr, &tid);
+    return static_cast<uint32_t>(tid);
+}
 
 #endif // __APPLE__
